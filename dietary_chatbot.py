@@ -25,6 +25,41 @@ import medicine_food_integration as mfi
 from food_suggestions import get_user_dietary_profile, load_food_database, filter_and_rank_foods
 
 
+# Automatically load .env file if present
+def _load_env_file():
+    candidates = [
+        Path(".env"),
+        Path(__file__).parent / ".env",
+        Path(__file__).parent.parent / ".env"
+    ]
+    for p in candidates:
+        if p.exists() and p.is_file():
+            try:
+                with open(p, "r", encoding="utf-8") as f:
+                    for line in f:
+                        line = line.strip()
+                        if line and not line.startswith("#") and "=" in line:
+                            k, v = line.split("=", 1)
+                            k = k.strip()
+                            v = v.strip().strip("'\" \t\r\n")
+                            if k and v and k not in os.environ:
+                                os.environ[k] = v
+            except Exception:
+                pass
+
+_load_env_file()
+
+
+def sanitize_gemini_api_key(key):
+    """Clean and normalize API key string, removing whitespace, quotes, and prefixes."""
+    if not key:
+        return ""
+    clean = str(key).strip().strip("'\" \t\r\n")
+    if clean.lower().startswith("gemini_api_key="):
+        clean = clean.split("=", 1)[1].strip().strip("'\" \t\r\n")
+    return clean
+
+
 # =============================================================================
 # 1. OPTIONAL GOOGLE GEMINI API CONNECTOR
 # =============================================================================
@@ -34,7 +69,8 @@ def call_gemini_api(api_key, user_message, patient_context, chat_history=None):
     Calls Google Gemini REST API (gemini-1.5-flash) using standard requests.
     Grounded with the patient's exact clinical profile and medication safety rules.
     """
-    url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key={api_key}"
+    clean_key = sanitize_gemini_api_key(api_key)
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key={clean_key}"
 
     comorbs_str = ", ".join(patient_context.get("comorbidity_names", [])) or "None declared"
     meds_str = ", ".join([f"{m['db_name']} ({m.get('dosage', '')})" for m in patient_context.get("active_profiles", [])]) or "None"
@@ -60,16 +96,27 @@ CORE CLINICAL RULES & DRUG INTERACTIONS:
 
     contents = []
 
-    # Include recent turns for conversational continuity
+    # Include recent turns for conversational continuity ensuring valid alternation
+    valid_turns = []
     if chat_history:
-        for msg in chat_history[-4:]:
-            role = "user" if msg["role"] == "user" else "model"
-            contents.append({
-                "role": role,
-                "parts": [{"text": msg["content"]}]
-            })
+        for msg in chat_history[-6:]:
+            role = "user" if msg.get("role") == "user" else "model"
+            txt = msg.get("content", "").strip()
+            if not txt:
+                continue
+            # Must start with user
+            if not valid_turns and role != "user":
+                continue
+            # Avoid consecutive same role
+            if valid_turns and valid_turns[-1]["role"] == role:
+                continue
+            valid_turns.append({"role": role, "parts": [{"text": txt}]})
 
-    # Current user turn with injected system prompt context
+    # If the last history turn is 'user', remove it so the new user turn appends cleanly
+    if valid_turns and valid_turns[-1]["role"] == "user":
+        valid_turns.pop()
+
+    contents.extend(valid_turns)
     contents.append({
         "role": "user",
         "parts": [{"text": f"[Clinical Context & Safety Rules: {system_instruction}]\n\nPatient Question: {user_message}"}]
@@ -257,12 +304,16 @@ class ClinicalDietaryAssistant:
             if "atorvastatin" in q and ("night" in q or "bedtime" in q):
                 return "WHY_ATORVASTATIN_BEDTIME"
 
-        # 3. Prepared Indian Dishes (Khichdi, Idli, Dosa, Poha, Upma, Roti, Jaggery, etc.)
-        prepared_dishes = ["khichdi", "idli", "dosa", "poha", "upma", "chapati", "roti", "paratha",
-                           "jaggery", "gur", "honey", "sugar", "sweets", "coffee", "chai", "tea", "salad", "paneer"]
+        # 3. Prepared Indian Dishes & Popular Foods (Khichdi, Idli, Burger, Pizza, etc.)
+        prepared_dishes = [
+            "khichdi", "idli", "dosa", "poha", "upma", "chapati", "roti", "paratha",
+            "jaggery", "gur", "honey", "sugar", "sweets", "coffee", "chai", "tea", "salad", "paneer",
+            "burger", "pizza", "samosa", "french fries", "fries", "noodles", "maggi", "maggie", "pakora"
+        ]
         for dish in prepared_dishes:
             if dish in q:
-                return f"PREPARED_DISH_{dish.upper()}"
+                dish_key = dish.replace("french fries", "fries").replace("maggi", "noodles").replace("maggie", "noodles")
+                return f"PREPARED_DISH_{dish_key.upper()}"
 
         # 4. Comparative Queries (Oats vs Ragi, Brown vs White Rice)
         if any(w in q for w in ["vs", "compare", "better", "difference"]):
@@ -444,6 +495,53 @@ class ClinicalDietaryAssistant:
                 "**Clinical Analysis:**\n"
                 "- Zero glycemic index with high satiety and rich calcium (480mg/100g).\n"
                 "- **Dyslipidemia Note:** Full-cream buffalo milk paneer is rich in saturated fatty acids. Choose paneer made from low-fat/toned cow's milk to protect your lipid profile while enjoying 18g of clean protein per 100g."
+            )
+        elif dish_key == "BURGER":
+            return (
+                "### 🍔 Clinical Guidance: Burger & Commercial Fast Food\n"
+                "> 🔴 **NOT RECOMMENDED / STRICT PORTION CONTROL & HEALTHY TWEAKS REQUIRED**\n\n"
+                "**Clinical & Nutritional Analysis:**\n"
+                "- 🍞 **Refined Carbohydrates:** Commercial burger buns are made from refined white flour (maida) with added sugars. They carry a very high Glycemic Index (GI > 75), causing steep postprandial glucose surges.\n"
+                "- 🧂 **High Sodium Content:** A standard fast-food burger contains **800mg–1,200mg of sodium** (50–60% of the entire daily DASH ceiling for hypertension).\n"
+                "- 🫀 **Saturated & Trans Fats:** Commercial fried patties, processed cheese, and mayonnaise elevate LDL-cholesterol and worsen insulin sensitivity.\n\n"
+                "**Cardio- & Diabetes-Friendly Homemade Alternatives:**\n"
+                "- 🌾 **Base:** Use 100% whole wheat or multigrain toasted buns, or wrap the patty in crisp lettuce leaves.\n"
+                "- 🥗 **Patty:** Prepare a homemade, non-fried patty using sprouted moong dal, mashed low-fat paneer, boiled chana, and oats with fresh herbs.\n"
+                "- 🌿 **Condiment Swaps:** Replace mayonnaise and commercial ketchup with fresh mint-coriander chutney, hung curd (Greek yogurt) dip, and fresh tomato/cucumber slices."
+            )
+        elif dish_key == "PIZZA":
+            return (
+                "### 🍕 Clinical Guidance: Pizza\n"
+                "> 🔴 **HIGH GLYCEMIC & HIGH SODIUM CAUTION**\n\n"
+                "**Clinical Hazards:**\n"
+                "- Refined maida crust + high-sodium processed cheese + sodium-dense tomato paste can deliver over **1,500mg sodium per two slices**.\n"
+                "- Saturated fats from melted cheese interfere with endothelial function and insulin sensitivity.\n\n"
+                "**Smart Modification:**\n"
+                "- If having pizza, choose a **thin whole-wheat or sourdough crust**, double the vegetable toppings (capsicum, onions, mushrooms, spinach), and ask for light or low-fat cheese."
+            )
+        elif dish_key in ["SAMOSA", "PAKORA"]:
+            return (
+                f"### 🥟 Clinical Guidance: {dish_key.title()} & Deep-Fried Snacks\n"
+                "> 🔴 **STRICTLY RESTRICT FOR CARDIOVASCULAR & METABOLIC HEALTH**\n\n"
+                "**Why deep-fried snacks are harmful:**\n"
+                "- **Reheated Oils:** Deep frying oxidizes cooking oils into trans fatty acids and lipid peroxides that directly promote plaque formation in arteries.\n"
+                "- **Potato + Maida Combo:** High starch and zero fiber cause an immediate postprandial glucose spike.\n\n"
+                "**Healthier Alternative:**\n"
+                "- Try **air-fried or baked samosas** stuffed with spiced sprouted moong dal and peas rather than boiled potatoes."
+            )
+        elif dish_key in ["FRIES"]:
+            return (
+                "### 🍟 Clinical Guidance: French Fries & Potato Chips\n"
+                "> 🔴 **HIGH RISK: REFINED CARBOHYDRATE + TRANS FAT + SODIUM**\n\n"
+                "- French fries are high-glycemic potatoes deep-fried in high-heat oil and heavily salted.\n"
+                "- Substitute with **roasted makhana (fox nuts)**, roasted chana, or baked sweet potato wedges tossed with jeera and lemon juice."
+            )
+        elif dish_key == "NOODLES":
+            return (
+                "### 🍜 Clinical Guidance: Instant Noodles (Maggi / Ramen)\n"
+                "> 🔴 **STRICT CLINICAL CAUTION (High Sodium & Refined Flour)**\n\n"
+                "- A single pack of instant noodles contains over **900mg–1,200mg of sodium** in the tastemaker seasoning packet.\n"
+                "- The noodle cakes are pre-fried in palm oil. Opt for **vegetable daliya (broken wheat)** or **foxtail millet vermicelli (semiya)** loaded with fresh vegetables."
             )
         else:
             return self.recommend_meal("lunch")
@@ -909,13 +1007,11 @@ class ClinicalDietaryAssistant:
             return "Please type a question about food options, meal ideas, or medicine safety."
 
         # If a valid Gemini API key is provided, route through Gemini for open-ended dialogue
-        if api_key and str(api_key).strip().startswith("AIza"):
-            try:
-                gemini_resp = call_gemini_api(api_key.strip(), user_message, self.profile, chat_history=chat_history)
+        clean_key = sanitize_gemini_api_key(api_key)
+        if clean_key and clean_key.startswith("AIza"):
+            gemini_resp = call_gemini_api(clean_key, user_message, self.profile, chat_history=chat_history)
+            if gemini_resp:
                 return gemini_resp
-            except Exception as e:
-                # If Gemini fails, gracefully proceed with local engine below
-                pass
 
         # Otherwise, process with the 100% local Clinical Decision Support (CDS) Engine
         intent = self.classify_intent(user_message)
@@ -1030,8 +1126,8 @@ def render_dietary_chat_interface(user_id):
     if "food_chat_messages" not in st.session_state:
         st.session_state.food_chat_messages = []
     if "gemini_api_key" not in st.session_state:
-        # Check environment variable
-        st.session_state.gemini_api_key = os.environ.get("GEMINI_API_KEY", "")
+        # Check environment variable or loaded .env
+        st.session_state.gemini_api_key = sanitize_gemini_api_key(os.environ.get("GEMINI_API_KEY", ""))
 
     p = assistant.profile
     allergies_display = p['allergies_raw'] if p['allergies_raw'] else "None declared"
@@ -1039,7 +1135,8 @@ def render_dietary_chat_interface(user_id):
     meds_count = len(assistant.active_profiles)
 
     # 1. Clinical Context Header
-    has_api_key = bool(st.session_state.gemini_api_key and st.session_state.gemini_api_key.startswith("AIza"))
+    clean_session_key = sanitize_gemini_api_key(st.session_state.gemini_api_key)
+    has_api_key = bool(clean_session_key and clean_session_key.startswith("AIza"))
     engine_badge = "<span class='badge-pill badge-green'>✨ Google Gemini AI Connected</span>" if has_api_key else "<span class='badge-pill badge-blue'>🛡️ Local Offline CDS Engine Active</span>"
 
     st.markdown(f"""
@@ -1063,22 +1160,44 @@ def render_dietary_chat_interface(user_id):
     """, unsafe_allow_html=True)
 
     # 2. Optional Gemini API Key Drawer
-    with st.expander("⚙️ AI Engine Settings: Local Offline vs. Google Gemini API (Free)", expanded=False):
+    with st.expander("⚙️ AI Engine Settings: Local Offline vs. Google Gemini API (Free)", expanded=not has_api_key):
         st.markdown(
             "MediAssist AI operates **100% offline and free** using its built-in ICMR-NIN Clinical Decision Support (CDS) engine. "
             "If you want **open-ended, human-like dialogue** for recipes, symptoms, and complex conversational follow-ups, you can optionally connect a free Google Gemini API key."
         )
-        api_input = st.text_input(
-            "Google Gemini API Key (starts with `AIza...`):",
-            value=st.session_state.gemini_api_key,
-            type="password",
-            placeholder="Paste your free Gemini API key here...",
-            help="Get a free API key from Google AI Studio: https://aistudio.google.com/app/apikey"
-        )
-        if api_input != st.session_state.gemini_api_key:
-            st.session_state.gemini_api_key = api_input
-            st.success("API key updated successfully!")
-            st.rerun()
+        col_inp, col_btn1, col_btn2 = st.columns([3, 1, 1])
+        with col_inp:
+            api_input = st.text_input(
+                "Google Gemini API Key (starts with `AIza...`):",
+                value=st.session_state.gemini_api_key,
+                type="password",
+                key="gemini_key_input_box",
+                placeholder="Paste your key here (e.g. AIzaSy...)",
+                help="Get a free API key from Google AI Studio: https://aistudio.google.com/app/apikey"
+            )
+        with col_btn1:
+            st.markdown("<div style='height: 28px;'></div>", unsafe_allow_html=True)
+            if st.button("💾 Save Key", use_container_width=True, key="btn_save_gemini_key"):
+                clean = sanitize_gemini_api_key(api_input)
+                st.session_state.gemini_api_key = clean
+                if clean.startswith("AIza"):
+                    st.success("✅ Gemini API Key saved & activated!")
+                elif clean:
+                    st.warning("⚠️ Note: Google Gemini API keys typically start with 'AIza'.")
+                else:
+                    st.info("API Key cleared.")
+                st.rerun()
+        with col_btn2:
+            st.markdown("<div style='height: 28px;'></div>", unsafe_allow_html=True)
+            if st.button("🗑️ Clear Key", use_container_width=True, key="btn_clear_gemini_key"):
+                st.session_state.gemini_api_key = ""
+                st.info("Switched to Local Offline Engine.")
+                st.rerun()
+
+        if has_api_key:
+            st.markdown("🟢 **Status:** Gemini AI is connected and active for all conversation queries.")
+        else:
+            st.markdown("🔵 **Status:** Running in 100% Local Offline mode (ICMR-NIN CDS Engine). To enable open-ended Gemini responses, paste your key above and click **Save Key**.")
 
         st.caption("🔒 *Privacy Note: Your key remains stored in your local session memory and is never shared.* [Get a Free Gemini API Key (Takes 1 min)](https://aistudio.google.com/app/apikey)")
 
